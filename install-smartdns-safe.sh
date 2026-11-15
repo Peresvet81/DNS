@@ -1,12 +1,15 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 PANEL_PORT="8080"
 BACKUP_DIR="/var/backups/smartdns-$(date +%Y%m%d-%H%M%S)"
 
 if [ "$(id -u)" -ne 0 ]; then echo "Запустите скрипт от root." >&2; exit 1; fi
 command -v ss >/dev/null || { echo "Нужна команда ss (iproute2)." >&2; exit 1; }
-mkdir -p "$BACKUP_DIR"
+for path in /opt/smartdns /etc/systemd/system/smartdns-panel.service; do
+    [ ! -e "$path" ] || { echo "Уже есть установка SmartDNS: нужен отдельный план миграции." >&2; exit 1; }
+done
+command -v apt-get >/dev/null || { echo "Поддерживаются Debian/Ubuntu." >&2; exit 1; }
 # Проверяем занятые порты до любых изменений. AmneziaVPN обычно использует UDP-порты,
 # а также может занимать 53/80/443; при конфликте безопаснее остановиться.
 for spec in "tcp:53" "udp:53" "tcp:80" "tcp:443" "tcp:${PANEL_PORT}"; do
@@ -16,12 +19,6 @@ for spec in "tcp:53" "udp:53" "tcp:80" "tcp:443" "tcp:${PANEL_PORT}"; do
     exit 2
   fi
 done
-# Сохраняем изменяемые файлы, чтобы откат был возможен.
-for f in /etc/dnsmasq.conf /etc/sniproxy.conf /etc/resolv.conf /etc/sysctl.d/99-smartdns.conf; do
-  [ -e "$f" ] && cp -a -- "$f" "$BACKUP_DIR/"
-done
-
-
 echo "===================================================="
 echo " Установка SmartDNS & UDP Hub (Multi-User Edition)"
 echo "===================================================="
@@ -29,61 +26,45 @@ read -r -p "Введите новый пароль для веб-панели (E
 export ADMIN_PASS="${INPUT_PASS:-$(openssl rand -hex 18)}"
 
 echo "[1/7] Определение сетевых параметров..."
-export EXT_IP=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me)
-export INT_IP=$(hostname -I | awk '{print $1}')
+export EXT_IP=$(curl -4fsS --max-time 10 https://api.ipify.org || curl -4fsS --max-time 10 https://ifconfig.me)
+export INT_IP=$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
 export SSH_IP=$(echo "${SSH_CLIENT:-}" | awk '{print $1}')
-grep -q "$(hostname)" /etc/hosts || echo "127.0.1.1 $(hostname)" >> /etc/hosts
+
 
 echo "Внешний IP: $EXT_IP | Внутренний IP: $INT_IP | Текущий IP клиента: ${SSH_IP:-не определен}"
 
-echo "[2/7] Настройка Swap (1 ГБ) для стабильной работы на e2-micro..."
-if [ ! -f /swapfile ] && [ "$(swapon --show | wc -l)" -eq 0 ]; then
-    fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none
-    chmod 600 /swapfile
-    mkswap /swapfile >/dev/null
-    swapon /swapfile
-    grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    echo "Swap 1 ГБ успешно создан и активирован."
-else
-    echo "Swap уже активен, пропускаем."
-fi
-
-echo "[3/7] Отключение systemd-resolved и установка пакетов..."
-# Не отключаем systemd-resolved и не переписываем resolv.conf: это важно для AmneziaVPN.
-if systemctl is-active --quiet systemd-resolved; then
-  echo "systemd-resolved уже активен; оставляем его без изменений."
-fi
-
+echo "[2/7] Установка зависимостей без запуска штатных служб..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y dnsmasq sniproxy python3 python3-flask iptables curl dnsutils
-
-echo "[4/7] Настройка ядра Linux и снятие ограничений соединений..."
-cat << EOF > /etc/sysctl.d/99-smartdns.conf
-net.ipv4.ip_forward=1
-net.ipv4.conf.all.rp_filter=0
-net.ipv4.conf.default.rp_filter=0
-fs.file-max=2097152
-EOF
-sysctl --system >/dev/null
-
-mkdir -p /etc/systemd/system/dnsmasq.service.d
-cat << 'EOF' > /etc/systemd/system/dnsmasq.service.d/override.conf
+# dnsmasq-base не содержит штатной службы dnsmasq.
+# Не допускаем автозапуск sniproxy пакетным менеджером.
+if [ -e /usr/sbin/policy-rc.d ]; then
+    echo "Обнаружен policy-rc.d. Для предсказуемой установки остановка." >&2; exit 1
+fi
+trap 'rm -f /usr/sbin/policy-rc.d' EXIT
+printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+chmod 755 /usr/sbin/policy-rc.d
+apt-get update
+apt-get install -y dnsmasq-base sniproxy python3 python3-flask iptables curl dnsutils
+rm -f /usr/sbin/policy-rc.d
+trap - EXIT
+mkdir -p /opt/smartdns
+chmod 700 /opt/smartdns
+cat > /etc/systemd/system/smartdns-dns.service <<'EOF'
+[Unit]
+Description=Isolated SmartDNS resolver
+After=network.target
 [Service]
-LimitNOFILE=65535
-ExecStart=
-ExecStart=/usr/sbin/dnsmasq -x /run/dnsmasq/dnsmasq.pid -u dnsmasq -r /run/dnsmasq/resolv.conf -7 /etc/dnsmasq.d,.dpkg-dist,.dpkg-old,.dpkg-new
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/opt/smartdns/dnsmasq.conf --pid-file=
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
 
 echo "[5/7] Настройка SNI Proxy (IPv4 + LimitNOFILE=65535)..."
-systemctl stop sniproxy 2>/dev/null || true
-pkill -x sniproxy 2>/dev/null || true
-[ -f /etc/default/sniproxy ] && sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/sniproxy
 
-cat << 'EOF' > /etc/sniproxy.conf
+cat << EOF > /opt/smartdns/sniproxy.conf
 user daemon
-pidfile /var/run/sniproxy.pid
+pidfile /run/smartdns-sni/proxy.pid
 
 resolver {
     nameserver 8.8.8.8
@@ -91,12 +72,12 @@ resolver {
     mode ipv4_only
 }
 
-listen 0.0.0.0:80 {
+listen ${INT_IP}:80 {
     proto http
     table http_hosts
 }
 
-listen 0.0.0.0:443 {
+listen ${INT_IP}:443 {
     proto tls
     table https_hosts
 }
@@ -110,15 +91,16 @@ table https_hosts {
 }
 EOF
 
-cat << 'EOF' > /etc/systemd/system/sniproxy.service
+cat << 'EOF' > /etc/systemd/system/smartdns-sni.service
 [Unit]
 Description=SNI Proxy
 After=network.target
 
 [Service]
 Type=simple
+RuntimeDirectory=smartdns-sni
 LimitNOFILE=65535
-ExecStart=/usr/sbin/sniproxy -c /etc/sniproxy.conf -f
+ExecStart=/usr/sbin/sniproxy -c /opt/smartdns/sniproxy.conf -f
 Restart=always
 RestartSec=3
 
@@ -127,8 +109,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable sniproxy
-systemctl restart sniproxy
+systemctl enable smartdns-sni
+# Прокси запускается только после настройки ACL панелью.
 
 echo "[6/7] Создание конфигурации и веб-панели SmartDNS & UDP Hub..."
 mkdir -p /opt/smartdns
@@ -186,7 +168,7 @@ with open(cfg_path, "w", encoding="utf-8") as f:
 chmod 600 /opt/smartdns/config.json
 
 cat << 'EOF' > /opt/smartdns/app.py
-import os, json, subprocess, shutil, threading, secrets
+import os, json, subprocess, shutil, threading, secrets, ipaddress
 from functools import wraps
 from flask import Flask, request, render_template_string, redirect, url_for, session, flash, Response
 
@@ -269,12 +251,16 @@ def resolve_real_ip(domain):
 
 def apply_system_changes():
     cfg = load_config()
+    for value in extract_ips(cfg.get("allowed_ips", [])):
+        ipaddress.IPv4Network(value, strict=False)
     ext_ip = cfg["ext_ip"]
     int_ip = cfg["int_ip"]
 
     lines = [
+        "bind-interfaces",
+        "no-resolv",
         "port=53",
-        f"listen-address=127.0.0.1,{int_ip}",
+        f"listen-address={int_ip}",
         "server=8.8.8.8",
         "server=1.1.1.1",
         "cache-size=4096"
@@ -292,43 +278,31 @@ def apply_system_changes():
             if d:
                 lines.append(f"address=/{d}/{ext_ip}")
 
-    with open("/etc/dnsmasq.conf", "w", encoding="utf-8") as f:
+    with open("/opt/smartdns/dnsmasq.conf", "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
-    subprocess.run(["systemctl", "restart", "dnsmasq"], check=False)
+    subprocess.run(["systemctl", "restart", "smartdns-dns"], check=False)
 
-    # Не отключаем UFW и не очищаем общие таблицы/цепочки: AmneziaVPN может ими пользоваться.
-    subprocess.run(["iptables", "-w", "-D", "INPUT", "-j", "SMARTDNS_ACL"], check=False)
-    subprocess.run(["iptables", "-w", "-F", "SMARTDNS_ACL"], check=False)
-    subprocess.run(["iptables", "-w", "-X", "SMARTDNS_ACL"], check=False)
-    subprocess.run(["iptables", "-w", "-N", "SMARTDNS_ACL"], check=False)
-    subprocess.run(["iptables", "-w", "-I", "INPUT", "1", "-j", "SMARTDNS_ACL"], check=False)
+    # Только собственная цепочка, только трафик на адрес и порты SmartDNS.
+    # NAT/FORWARD/raw, UFW и настройки ядра не меняются.
+    def ipt(*args):
+        return subprocess.run(["iptables", "-w", *args], check=True)
+    exists = subprocess.run(["iptables", "-w", "-S", "SDNS_SAFE_V2"], capture_output=True).returncode == 0
+    if exists:
+        ipt("-F", "SDNS_SAFE_V2")
+    else:
+        ipt("-N", "SDNS_SAFE_V2")
+    ipt("-A", "SDNS_SAFE_V2", "-i", "lo", "-j", "ACCEPT")
+    for ip in extract_ips(cfg.get("allowed_ips", [])):
+        ipaddress.IPv4Network(ip, strict=False)
+        ipt("-A", "SDNS_SAFE_V2", "-s", ip, "-j", "ACCEPT")
+    ipt("-A", "SDNS_SAFE_V2", "-j", "DROP")
+    for proto, ports in (("tcp", "53,80,443"), ("udp", "53")):
+        rule = ["INPUT", "-d", int_ip, "-p", proto, "-m", "multiport", "--dports", ports, "-j", "SDNS_SAFE_V2"]
+        if subprocess.run(["iptables", "-w", "-C", *rule], capture_output=True).returncode:
+            ipt("-I", "INPUT", "1", *rule[1:])
+    subprocess.run(["systemctl", "start", "smartdns-sni"], check=True)
 
-    subprocess.run(["iptables", "-w", "-A", "SMARTDNS_ACL", "-i", "lo", "-j", "ACCEPT"], check=False)
-    subprocess.run(["iptables", "-w", "-A", "SMARTDNS_ACL", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"], check=False)
-    subprocess.run(["iptables", "-w", "-A", "SMARTDNS_ACL", "-p", "tcp", "--dport", "22", "-j", "ACCEPT"], check=False)
-    subprocess.run(["iptables", "-w", "-A", "SMARTDNS_ACL", "-p", "tcp", "--dport", "8080", "-j", "ACCEPT"], check=False)
-
-    clean_ips = extract_ips(cfg.get("allowed_ips", []))
-    for ip in clean_ips:
-        subprocess.run(["iptables", "-w", "-A", "SMARTDNS_ACL", "-s", ip, "-j", "ACCEPT"], check=False)
-
-    subprocess.run(["iptables", "-w", "-A", "SMARTDNS_ACL", "-p", "udp", "--dport", "53", "-j", "DROP"], check=False)
-    subprocess.run(["iptables", "-w", "-A", "SMARTDNS_ACL", "-p", "tcp", "-m", "multiport", "--dports", "53,80,443", "-j", "DROP"], check=False)
-
-    # Не очищаем nat целиком: правила AmneziaVPN сохраняются.
-    for rule in cfg.get("udp_rules", []):
-        port = str(rule.get("port", "")).strip()
-        target = str(rule.get("target", "")).strip()
-        if port and target:
-            real_ip = resolve_real_ip(target)
-            for ip in clean_ips:
-                subprocess.run([
-                    "iptables", "-t", "nat", "-A", "PREROUTING",
-                    "-s", ip, "-p", "udp", "--dport", port,
-                    "-j", "DNAT", "--to-destination", f"{real_ip}:{port.replace(':', '-')}"
-                ], check=False)
-            subprocess.run(["iptables", "-w", "-t", "nat", "-A", "POSTROUTING", "-p", "udp", "-d", real_ip, "-j", "MASQUERADE"], check=False)
 
 def _bg_apply():
     with LOCK:
@@ -418,7 +392,7 @@ HTML_TEMPLATE = """
           {% if cfg.ddns_tokens %}
             <ul class="list-group list-group-flush mb-2">
               {% for tok, name in cfg.ddns_tokens.items() %}
-                {% set full_url = 'http://' + cfg.ext_ip + ':8080/ddns/' + tok %}
+                {% set full_url = 'http://127.0.0.1:8080/ddns/' + tok %}
                 <li class="list-group-item bg-dark border-secondary py-2 px-2">
                   <div class="d-flex justify-content-between align-items-center mb-1">
                     <span class="fw-bold text-info small">{{ name }}</span>
@@ -678,10 +652,10 @@ def ddns_webhook(token):
 def index():
     cfg = load_config()
     client_ip = request.remote_addr
-    dns_ok = subprocess.run(["systemctl", "is-active", "--quiet", "dnsmasq"]).returncode == 0
-    sni_ok = subprocess.run(["systemctl", "is-active", "--quiet", "sniproxy"]).returncode == 0
+    dns_ok = subprocess.run(["systemctl", "is-active", "--quiet", "smartdns-dns"]).returncode == 0
+    sni_ok = subprocess.run(["systemctl", "is-active", "--quiet", "smartdns-sni"]).returncode == 0
     try:
-        logs = subprocess.check_output(["journalctl", "-u", "dnsmasq", "-n", "60", "--no-pager"], text=True)
+        logs = subprocess.check_output(["journalctl", "-u", "smartdns-dns", "-n", "60", "--no-pager"], text=True)
     except Exception:
         logs = "Логи недоступны."
     return render_template_string(
@@ -718,6 +692,7 @@ def del_token(token):
 @login_required
 def restart_service(svc):
     if svc in ("dnsmasq", "sniproxy"):
+        svc = {"dnsmasq": "smartdns-dns", "sniproxy": "smartdns-sni"}[svc]
         subprocess.run(["systemctl", "restart", svc], check=False)
         flash(f"Служба {svc} перезапущена.")
     return redirect(url_for("index"))
@@ -731,14 +706,14 @@ def test_domain():
     if not domain:
         return redirect(url_for("index"))
     try:
-        dns_res = subprocess.check_output(["dig", "+short", "@127.0.0.1", domain], text=True, timeout=3).strip().splitlines()
+        dns_res = subprocess.check_output(["dig", "+short", f"@{cfg['int_ip']}", domain], text=True, timeout=3).strip().splitlines()
         resolved = dns_res[0] if dns_res else "нет ответа"
     except Exception as e:
         resolved = f"ошибка DNS ({e})"
     is_proxied = (resolved == cfg["ext_ip"])
     try:
         curl_out = subprocess.check_output(
-            ["curl", "-sI", "-m", "4", "--resolve", f"{domain}:443:127.0.0.1", f"https://{domain}"],
+            ["curl", "-sI", "-m", "4", "--resolve", f"{domain}:443:{cfg['int_ip']}", f"https://{domain}"],
             text=True, stderr=subprocess.STDOUT
         ).splitlines()
         http_status = curl_out[0] if curl_out else "пустой ответ"
@@ -817,6 +792,8 @@ def add_preset(name):
 @login_required
 def add_udp():
     cfg = load_config()
+    flash("UDP NAT отключён для совместимости с AmneziaVPN.")
+    return redirect(url_for("index"))
     port = request.form.get("port", "").strip()
     target = request.form.get("target", "").strip()
     if port and target:
@@ -878,7 +855,7 @@ def change_password():
 
 if __name__ == "__main__":
     apply_system_changes()
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="127.0.0.1", port=8080)
 EOF
 
 echo "[7/7] Создание системной службы автозапуска..."
@@ -900,11 +877,13 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable smartdns-panel
+systemctl enable smartdns-panel smartdns-dns
 systemctl restart smartdns-panel
+sleep 3
+systemctl is-active --quiet smartdns-panel smartdns-dns smartdns-sni
 
 echo "===================================================="
 echo " УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!"
-echo " Панель управления: http://${EXT_IP}:${PANEL_PORT}"
+echo " Панель управления через SSH-туннель: http://127.0.0.1:${PANEL_PORT}"
 echo " Установленный пароль: ${ADMIN_PASS}"
 echo "===================================================="
